@@ -19,12 +19,13 @@ use server::world::world::World;
 use std::time::Duration;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::UnboundedSender as Sender;
+use crate::dungeon::room::room_data::RoomShape;
 
 mod assets;
 mod dungeon;
 
 pub fn initialize_world(tx: Sender<NetworkThreadMessage>) -> anyhow::Result<World<Dungeon>> {
-    let rng_seed: u64 = rand::random();
+    let rng_seed: u64 = /*rand::random();*/8432819203932612618;
     SeededRng::set_seed(rng_seed);
 
     let dungeon_layouts = &get_assets().dungeon_seeds;
@@ -39,6 +40,33 @@ pub fn initialize_world(tx: Sender<NetworkThreadMessage>) -> anyhow::Result<Worl
     // it will move in the stack causing those pointers to be invalid,
     // this can be fixed by using Box<T> if it is required
     let mut world = World::new(tx, dungeon);
+
+    // dungeon must have 36 total room tiles (6x6), with respect that a room for example can be 2x2 tiles large
+    let tile_count = world.extension.rooms.iter().map(|room| {
+        let room = room.borrow();
+        // use the room shape to determine how many tiles it covers because 1x1 == 1 tile, 2x2 == 4 tiles, etc
+        match room.data.shape {
+            RoomShape::OneByOne => 1,
+            RoomShape::OneByOneEnd => 1,
+            RoomShape::OneByOneBend => 1,
+            RoomShape::OneByOneCross => 1,
+            RoomShape::OneByOneStraight => 1,
+            RoomShape::OneByOneTriple => 1,
+            RoomShape::TwoByTwo => 4,
+            RoomShape::OneByTwo => 2,
+            RoomShape::OneByThree => 3,
+            RoomShape::OneByFour => 4,
+            RoomShape::L => 3,
+            RoomShape::Empty => 0,
+        }
+    }).sum::<i32>();
+
+    println!("Dungeon initialized with layout seed '' (rng seed {}) with {} rooms covering {} tiles.", rng_seed, world.extension.rooms.len(), tile_count);
+
+    // repeat if tiles are less than 36
+    if tile_count < 36 {
+        bail!("Dungeon layout has insufficient room tiles ({}/36). Try again.", tile_count);
+    }
 
     for room in world.extension.rooms.iter() {
         room.borrow().load_into_world(&mut world.chunk_grid);
@@ -99,7 +127,21 @@ async fn main() -> anyhow::Result<()> {
     let status = Status::new(0, 1, text, get_assets().icon_data);
     let (tx, mut rx) = start_network("127.0.0.1:4972", status);
 
-    let mut world = initialize_world(tx)?;
+    let mut world = {
+        const MAX_ATTEMPTS: usize = 25;
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match initialize_world(tx.clone()) {
+                Ok(w) => break w,
+                Err(err) if attempt < MAX_ATTEMPTS => {
+                    eprintln!("initialize_world fehlgeschlagen (Versuch {}/{}): {}. Wiederhole...", attempt, MAX_ATTEMPTS, err);
+                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                }
+                Err(err) => bail!("Initialisierung der Welt nach {} Versuchen fehlgeschlagen: {}", attempt, err),
+            }
+        }
+    };
     spawn_mort(&mut world);
 
     let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
